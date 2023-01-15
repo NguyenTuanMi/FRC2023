@@ -4,63 +4,104 @@
 
 package frc.robot.subsystems;
 
-import com.ctre.phoenix.motorcontrol.FeedbackDevice;
-import com.ctre.phoenix.motorcontrol.NeutralMode;
-import com.ctre.phoenix.motorcontrol.can.WPI_TalonSRX;
+import java.util.Collections;
+import java.util.List;
 
-import edu.wpi.first.math.kinematics.MecanumDriveKinematics;
-import edu.wpi.first.wpilibj.drive.MecanumDrive;
+import org.photonvision.PhotonCamera;
+
+import edu.wpi.first.math.VecBuilder;
+import edu.wpi.first.math.Vector;
+import edu.wpi.first.math.estimator.MecanumDrivePoseEstimator;
+import edu.wpi.first.math.geometry.Pose2d;
+import edu.wpi.first.math.geometry.Pose3d;
+import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.math.geometry.Rotation3d;
+import edu.wpi.first.math.geometry.Transform3d;
+import edu.wpi.first.math.kinematics.MecanumDriveWheelPositions;
+import edu.wpi.first.math.util.Units;
+// import edu.wpi.first.wpilibj.shuffleboard.Shuffleboard;
+// import edu.wpi.first.wpilibj.shuffleboard.ShuffleboardTab;
+import edu.wpi.first.wpilibj.smartdashboard.Field2d;
+import edu.wpi.first.math.numbers.N3;
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
 
-import static frc.robot.Constants.MOTOR_ID.*;
 import static frc.robot.Constants.VISION.*;
 
-import java.util.ArrayList;
-import java.util.List;
-public class Mecanum extends SubsystemBase {
-  /** Creates a new Mecanum. */
-  private WPI_TalonSRX leftFront = new WPI_TalonSRX(LEFT_FRONT);
-  private WPI_TalonSRX rightFront = new WPI_TalonSRX(RIGHT_FRONT);
-  private WPI_TalonSRX leftBack = new WPI_TalonSRX(LEFT_BACK);
-  private WPI_TalonSRX rightBack = new WPI_TalonSRX(RIGHT_BACK);
-  private MecanumDrive mecanum = new MecanumDrive(leftFront, leftBack, rightFront, rightBack);
-  private List<Double> encoder = new ArrayList<>();
-  private MecanumDriveKinematics kinematics = new MecanumDriveKinematics(LEFT_FRONT_CENTER, RIGHT_FRONT_CENTER, LEFT_FRONT_CENTER, RIGHT_BACK_CENTER);
-  // private MecanumDriveWheelPositions wheelPoses = new MecanumDriveWheelPositions();
+public class PoseEstimatorSubsystem extends SubsystemBase {
+  private Mecanum mecanum;
+  private PhotonCamera limelight;
+  private Gyro gyro;
+  // private ShuffleboardTab tab = Shuffleboard.getTab("Vision");
+  private Field2d field2d = new Field2d();
+  private double previousPipelineTimestamp = 0;
 
-  public Mecanum() {
-    leftFront.setInverted(false);
-    leftBack.setInverted(false);
+  // Unmodifed list 
+  private static final List<Pose3d> targetPoses = Collections.unmodifiableList(
+    List.of(
+    new Pose3d(TAG1_X, TAG1_Y, TAG1_Z, new Rotation3d(0, 0, TAG1_THETA)),
+    new Pose3d(TAG2_X, TAG2_Y, TAG2_Z, new Rotation3d(0, 0, TAG2_THETA))
+    )
+    );
 
-    leftFront.configSelectedFeedbackSensor(FeedbackDevice.CTRE_MagEncoder_Relative);
-    leftBack.configSelectedFeedbackSensor(FeedbackDevice.CTRE_MagEncoder_Relative);
-    rightFront.configSelectedFeedbackSensor(FeedbackDevice.CTRE_MagEncoder_Relative);
-    rightBack.configSelectedFeedbackSensor(FeedbackDevice.CTRE_MagEncoder_Relative);
+  // State standard deviation of the pose estimate, indicated how much you trust your estimation. Increase more, less trust
+  private static final Vector<N3> stateStdDevs = VecBuilder.fill(0.05, 0.05, 0.05);
+  // Standard deviation of the vision measurements
+  private static final Vector<N3> visionMeas = VecBuilder.fill(0.05, 0.05, 0.05);
 
-    leftFront.setNeutralMode(NeutralMode.Brake);
-    leftBack.setNeutralMode(NeutralMode.Brake);
-    rightFront.setNeutralMode(NeutralMode.Brake);
-    rightBack.setNeutralMode(NeutralMode.Brake);
+  private final MecanumDrivePoseEstimator poseEstimator;
+  /** Creates a new PoseEstimatorSubsystem. */
+  public PoseEstimatorSubsystem(Mecanum meca, PhotonCamera camera, Gyro gyro2) {
+    this.limelight = camera;
+    this.mecanum = meca;
+    this.gyro = gyro2;
+
+    poseEstimator = new MecanumDrivePoseEstimator(
+      mecanum.getKinematics(), 
+      new Rotation2d(Units.degreesToRadians(gyro.getYaw())), 
+      new MecanumDriveWheelPositions(
+        mecanum.getEncoder().get(0), 
+        mecanum.getEncoder().get(1), 
+        mecanum.getEncoder().get(2),
+        mecanum.getEncoder().get(3)
+        ), 
+      initialPose,
+      stateStdDevs,
+      visionMeas
+    );   
   }
 
-  public void drive (double x, double y, double zR) {
-    mecanum.driveCartesian(x, y, zR);
-  }
+  public Pose2d getPose2d() {
+    return poseEstimator.getEstimatedPosition();
+  } 
 
-  public List<Double> getEncoder() {
-    return encoder;
-  }
-
-  public MecanumDriveKinematics getKinematics() {
-    return kinematics;
-  }
-
-  @Override
+  @Override 
   public void periodic() {
+    var pipelineResult = limelight.getLatestResult();
+    var resultTimeStamp = pipelineResult.getTimestampSeconds();
+    if(resultTimeStamp != previousPipelineTimestamp && pipelineResult.hasTargets()) {
+      previousPipelineTimestamp = resultTimeStamp;
+      var target = pipelineResult.getBestTarget();
+      var fiducialId = target.getFiducialId();
+      if(target.getPoseAmbiguity() <= .2 && fiducialId >= 0 && fiducialId <= targetPoses.size()) {
+        var targetPose = targetPoses.get(fiducialId);
+        Transform3d camToTarget = target.getBestCameraToTarget();
+        Pose3d camPose = targetPose.transformBy(camToTarget.inverse());
+
+        var visionMeasurement = camPose.transformBy(CAMERA_TO_ROBOT);
+        poseEstimator.addVisionMeasurement(visionMeasurement.toPose2d(), resultTimeStamp);
+      }
+
+    }
+    poseEstimator.update(
+      new Rotation2d(gyro.getYaw()), 
+      new MecanumDriveWheelPositions(
+        mecanum.getEncoder().get(0), 
+        mecanum.getEncoder().get(1), 
+        mecanum.getEncoder().get(2),
+        mecanum.getEncoder().get(3)
+        ) 
+    );
+    field2d.setRobotPose(getPose2d());
     // This method will be called once per scheduler run
-    encoder.add(0, leftFront.getSelectedSensorPosition());
-    encoder.add(1, rightFront.getSelectedSensorPosition());
-    encoder.add(2, leftBack.getSelectedSensorPosition());
-    encoder.add(3, rightBack.getSelectedSensorPosition());
   }
 }
